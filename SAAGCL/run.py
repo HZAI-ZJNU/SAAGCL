@@ -12,7 +12,6 @@ from tqdm import tqdm
 from aug import redundancy_pruning, neighbor_completion
 import copy
 
-
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # Set argument
@@ -29,20 +28,18 @@ parser.add_argument('--tau', type=float, default=0.07)
 parser.add_argument('--degree', type=int, default=6)
 parser.add_argument('--batch_size', type=int, default=300)
 parser.add_argument('--subgraph_size', type=int, default=4)
-parser.add_argument('--readout', type=str, default='avg')  #max min avg weighted_sum
+parser.add_argument('--readout', type=str, default='avg')  # max min avg weighted_sum
 parser.add_argument('--neg_sam_rat', type=int, default=1)
 parser.add_argument('--drop_prob', type=float, default=0.0)
 parser.add_argument('--weight_decay', type=float, default=0.0)
 parser.add_argument('--gpu_id', type=int, default=0)
-
 
 args = parser.parse_args()
 
 batch_size = args.batch_size
 subgraph_size = args.subgraph_size
 
-print('Dataset: ',args.dataset)
-
+print('Dataset: ', args.dataset)
 
 dgl.random.seed(args.seed)
 np.random.seed(args.seed)
@@ -55,258 +52,270 @@ os.environ['OMP_NUM_THREADS'] = '1'
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-device = args.gpu_id
-adj, features, ano_label = load_mat(args.dataset)
+dev_id = args.gpu_id
+adj_matrix, feat_data, anomaly_labels = load_mat(args.dataset)
 
+feat_data, _ = preprocess_features(feat_data)
 
-features, _ = preprocess_features(features)
+dgl_g = adj_to_dgl_graph(adj_matrix)
+dgl_g = dgl_g.to(dev_id)
 
-dgl_graph = adj_to_dgl_graph(adj)
-dgl_graph = dgl_graph.to(device)
+num_nodes = feat_data.shape[0]
+feature_size = feat_data.shape[1]
 
-nb_nodes = features.shape[0]
-ft_size = features.shape[1]
+adj_tens = dgl_g.adjacency_matrix().to_dense().clone().detach().requires_grad_(True)
+node_degrees = adj_tens.sum(0).detach().numpy().squeeze()
 
-adj_tensor = dgl_graph.adjacency_matrix().to_dense().clone().detach().requires_grad_(True)
-degree = adj_tensor.sum(0).detach().numpy().squeeze()
+adj_tens = adj_tens + torch.eye(adj_tens.size(0))
+adj_tens = adj_tens.to(dev_id)
 
-adj_tensor = adj_tensor + torch.eye(adj_tensor.size(0))
-adj_tensor = adj_tensor.to(device)
+adj_matrix = normalize_adj(adj_matrix)
+adj_matrix = (adj_matrix + sp.eye(adj_matrix.shape[0])).todense()
 
-adj = normalize_adj(adj)
-adj = (adj + sp.eye(adj.shape[0])).todense()
-
-features = torch.FloatTensor(features[np.newaxis]).to(device)
-adj = torch.FloatTensor(adj[np.newaxis]).to(device)
+feat_data = torch.FloatTensor(feat_data[np.newaxis]).to(dev_id)
+adj_matrix = torch.FloatTensor(adj_matrix[np.newaxis]).to(dev_id)
 
 # Initialize model and optimiser
-model = Model(ft_size, args.embedding_dim, 'prelu', args.neg_sam_rat, args.readout).to(device)
-optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+gcl_model = Model(feature_size, args.embedding_dim, 'prelu', args.neg_sam_rat, args.readout).to(dev_id)
+optimizer = torch.optim.Adam(gcl_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-gene = Gene(nb_nodes, ft_size, 128)
-disc = Disc(128, 1)
+generator = Gene(num_nodes, feature_size, 128)
+discriminator = Disc(128, 1)
 
-bce_loss = nn.BCELoss().to(device)
+bce_loss_func = nn.BCELoss().to(dev_id)
 
-best_gene = copy.deepcopy(gene)
+best_gen_model = copy.deepcopy(generator)
 
-b_xent = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor([args.neg_sam_rat]).to(device))
+b_xent = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor([args.neg_sam_rat]).to(dev_id))
 
-xent = nn.CrossEntropyLoss().to(device)
-alter = 0
-cnt_wait = 0
-best = 1e9
-best_t = 0
-batch_num = nb_nodes // batch_size + 1
-ano_sim, sim = None, None
+cross_ent_loss = nn.CrossEntropyLoss().to(dev_id)
+alter_count = 0
+wait_count = 0
+best_loss = 1e9
+best_ep = 0
+num_batches = num_nodes // batch_size + 1
+ano_sim_matrix, sim_matrix = None, None
 
-added_adj_zero_row = torch.zeros((nb_nodes, 1, subgraph_size)).to(device)
-added_adj_zero_col = torch.zeros((nb_nodes, subgraph_size + 1, 1)).to(device)
-added_adj_zero_col[:,-1,:] = 1.
-added_feat_zero_row = torch.zeros((nb_nodes, 1, ft_size)).to(device)
+# These tensors are for padding subgraphs to a uniform size (subgraph_size + 1)
+pad_adj_row = torch.zeros((num_nodes, 1, subgraph_size)).to(dev_id)
+pad_adj_col = torch.zeros((num_nodes, subgraph_size + 1, 1)).to(dev_id)
+pad_adj_col[:, -1, :] = 1.
+pad_feat_row = torch.zeros((num_nodes, 1, feature_size)).to(dev_id)
 
 # Train model
-with tqdm(total=args.train_epoch) as pbar:
-    pbar.set_description('Training')
-    loss_matrix_list = []
+with tqdm(total=args.train_epoch) as prog_bar:
+    prog_bar.set_description('Training')
+    loss_hist_list = []
 
-    for epoch in range(args.train_epoch):
+    for epoch_num in range(args.train_epoch):
 
-        loss_full_batch = torch.zeros((nb_nodes,1)).to(device)
+        full_batch_loss = torch.zeros((num_nodes, 1)).to(dev_id)
 
-        model.train()
+        gcl_model.train()
 
-        all_idx = list(range(nb_nodes))
-        random.shuffle(all_idx)
+        all_indices = list(range(num_nodes))
+        random.shuffle(all_indices)
 
-        total_loss = 0.
+        total_epoch_loss = 0.
         all_node_features = []
-        loss_matrix = torch.zeros((nb_nodes,2)).to(device)
-        diff_feat = torch.zeros((nb_nodes,args.embedding_dim)).to(device)
-      
+        cur_loss_matrix = torch.zeros((num_nodes, 2)).to(dev_id)
+        feature_diff = torch.zeros((num_nodes, args.embedding_dim)).to(dev_id)
 
-        if epoch < args.train_epoch // 2:
-            graph1, adj1 = dgl_graph, adj
-            graph2, feat1, feat2, adj2 = redundancy_pruning(dgl_graph, adj_tensor, sim, features.squeeze(), degree, 0.2, 0.2, args.threshold)
+        if epoch_num < args.train_epoch // 2:
+            graph_v1, adj_v1 = dgl_g, adj_matrix
+            graph_v2, feature_v1, feature_v2, adj_v2 = redundancy_pruning(dgl_g, adj_tens, sim_matrix,
+                                                                          feat_data.squeeze(), node_degrees, 0.2, 0.2,
+                                                                          args.threshold)
         else:
-            graph1, graph2, feat1, feat2, adj1, adj2 = neighbor_completion(dgl_graph, adj_tensor, sim, ano_sim, features.squeeze(), degree, 
-            0.2, 0.2, 0.2, 0.2, args.threshold, device)
+            graph_v1, graph_v2, feature_v1, feature_v2, adj_v1, adj_v2 = neighbor_completion(dgl_g, adj_tens,
+                                                                                             sim_matrix, ano_sim_matrix,
+                                                                                             feat_data.squeeze(),
+                                                                                             node_degrees,
+                                                                                             0.2, 0.2, 0.2, 0.2,
+                                                                                             args.threshold, dev_id)
 
-      
-        subgraphs1 = generate_rwr_subgraph(graph1, subgraph_size)
-        subgraphs2 = generate_rwr_subgraph(graph2, subgraph_size)
+        subg_set1 = generate_rwr_subgraph(graph_v1, subgraph_size)
+        subg_set2 = generate_rwr_subgraph(graph_v2, subgraph_size)
 
-        for batch_idx in range(batch_num):
+        for batch_num_idx in range(num_batches):
 
-            optimiser.zero_grad()
+            optimizer.zero_grad()
 
-            is_final_batch = (batch_idx == (batch_num - 1))
+            is_last_batch = (batch_num_idx == (num_batches - 1))
 
-            if not is_final_batch:
-                idx = all_idx[batch_idx * batch_size: (batch_idx + 1) * batch_size]
+            if not is_last_batch:
+                indices = all_indices[batch_num_idx * batch_size: (batch_num_idx + 1) * batch_size]
             else:
-                idx = all_idx[batch_idx * batch_size:]
+                indices = all_indices[batch_num_idx * batch_size:]
 
-            cur_batch_size = len(idx)
+            current_batch_size = len(indices)
 
-            lbl = torch.unsqueeze(torch.cat((torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.neg_sam_rat))), 1).to(device)
+            batch_labels = torch.unsqueeze(
+                torch.cat((torch.ones(current_batch_size), torch.zeros(current_batch_size * args.neg_sam_rat))), 1).to(
+                dev_id)
 
-            ba = []
-            bf = []
-            added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size)).to(device)
-            added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1)).to(device)
-            added_adj_zero_col[:, -1, :] = 1.
-            added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size)).to(device)
+            batch_adj_list = []
+            batch_feat_list = []
+            pad_adj_row_b = torch.zeros((current_batch_size, 1, subgraph_size)).to(dev_id)
+            pad_adj_col_b = torch.zeros((current_batch_size, subgraph_size + 1, 1)).to(dev_id)
+            pad_adj_col_b[:, -1, :] = 1.
+            pad_feat_row_b = torch.zeros((current_batch_size, 1, feature_size)).to(dev_id)
 
-            for i in idx:
-                cur_adj = adj1[:, subgraphs1[i], :][:, :, subgraphs1[i]]
-                cur_feat = feat1[:, subgraphs1[i], :]
+            for i in indices:
+                current_adj = adj_v1[:, subg_set1[i], :][:, :, subg_set1[i]]
+                current_feat = feature_v1[:, subg_set1[i], :]
 
-                ba.append(cur_adj)
-                bf.append(cur_feat)
+                batch_adj_list.append(current_adj)
+                batch_feat_list.append(current_feat)
 
-            ba = torch.cat(ba).to(device)
-            ba = torch.cat((ba, added_adj_zero_row), dim=1)
-            ba = torch.cat((ba, added_adj_zero_col), dim=2)
-            bf = torch.cat(bf).to(device)
-            bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]),dim=1)
+            b_adj_v1 = torch.cat(batch_adj_list).to(dev_id)
+            b_adj_v1 = torch.cat((b_adj_v1, pad_adj_row_b), dim=1)
+            b_adj_v1 = torch.cat((b_adj_v1, pad_adj_col_b), dim=2)
+            b_feat_v1 = torch.cat(batch_feat_list).to(dev_id)
+            b_feat_v1 = torch.cat((b_feat_v1[:, :-1, :], pad_feat_row_b, b_feat_v1[:, -1:, :]), dim=1)
 
-            logits1, h1, g1 = model(bf, ba)
-            
-            ba = []
-            bf = []
-            added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size)).to(device)
-            added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1)).to(device)
-            added_adj_zero_col[:, -1, :] = 1.
-            added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size)).to(device)
-            for i in idx:
-                cur_adj = adj2[:, subgraphs2[i], :][:, :, subgraphs2[i]]
-                cur_feat = feat2[:, subgraphs2[i], :]
+            logits_v1, h_v1, g_v1 = gcl_model(b_feat_v1, b_adj_v1)
 
-                ba.append(cur_adj)
-                bf.append(cur_feat)
+            batch_adj_list = []
+            batch_feat_list = []
+            pad_adj_row_b = torch.zeros((current_batch_size, 1, subgraph_size)).to(dev_id)
+            pad_adj_col_b = torch.zeros((current_batch_size, subgraph_size + 1, 1)).to(dev_id)
+            pad_adj_col_b[:, -1, :] = 1.
+            pad_feat_row_b = torch.zeros((current_batch_size, 1, feature_size)).to(dev_id)
+            for i in indices:
+                current_adj = adj_v2[:, subg_set2[i], :][:, :, subg_set2[i]]
+                current_feat = feature_v2[:, subg_set2[i], :]
 
-            ba = torch.cat(ba).to(device)
-            ba = torch.cat((ba, added_adj_zero_row), dim=1)
-            ba = torch.cat((ba, added_adj_zero_col), dim=2)
-            bf = torch.cat(bf).to(device)
-            bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]),dim=1)
+                batch_adj_list.append(current_adj)
+                batch_feat_list.append(current_feat)
 
-            logits2, h2, g2 = model(bf, ba)
-      
-            pred1, pred2 = torch.mm(h1, h2.T), torch.mm(h2, h1.T)
-            pred3, pred4 = torch.mm(logits1, logits2.T), torch.mm(logits2, logits1.T)
+            b_adj_v2 = torch.cat(batch_adj_list).to(dev_id)
+            b_adj_v2 = torch.cat((b_adj_v2, pad_adj_row_b), dim=1)
+            b_adj_v2 = torch.cat((b_adj_v2, pad_adj_col_b), dim=2)
+            b_feat_v2 = torch.cat(batch_feat_list).to(dev_id)
+            b_feat_v2 = torch.cat((b_feat_v2[:, :-1, :], pad_feat_row_b, b_feat_v2[:, -1:, :]), dim=1)
 
-            labels = torch.arange(pred1.shape[0]).to(device)
-            labels1 = torch.arange(pred3.shape[0]).to(device)
+            logits_v2, h_v2, g_v2 = gcl_model(b_feat_v2, b_adj_v2)
 
-            loss_fn = (xent(pred1 / args.tau, labels) + xent(pred2 / args.tau, labels) + xent(pred3 / args.tau, labels1) + xent(pred4 / args.tau, labels1)) / 4
+            # InfoMax loss terms: cross-view similarities
+            pred_h_12, pred_h_21 = torch.mm(h_v1, h_v2.T), torch.mm(h_v2, h_v1.T)
+            pred_g_12, pred_g_21 = torch.mm(logits_v1, logits_v2.T), torch.mm(logits_v2, logits_v1.T)
 
-            loss_all = b_xent(logits1, lbl) + b_xent(logits2, lbl)
-            
-            loss_matrix[idx] = torch.cat((loss_all[:cur_batch_size], loss_all[cur_batch_size:]), dim=1)
-            diff_feat[idx] = ((h1 -g1) + (h2 - g2)) / 2
+            # Labels for CL objectives (main diagonal)
+            cl_labels_h = torch.arange(pred_h_12.shape[0]).to(dev_id)
+            cl_labels_g = torch.arange(pred_g_12.shape[0]).to(dev_id)
 
-            loss = torch.mean(loss_all) + loss_fn * args.alpha
+            loss_cl_terms = (cross_ent_loss(pred_h_12 / args.tau, cl_labels_h) + cross_ent_loss(pred_h_21 / args.tau,
+                                                                                                cl_labels_h) +
+                             cross_ent_loss(pred_g_12 / args.tau, cl_labels_g) + cross_ent_loss(pred_g_21 / args.tau,
+                                                                                                cl_labels_g)) / 4
 
-            loss.backward()
-            optimiser.step()
+            # Anomaly scoring (Node-Context discrimination)
+            loss_anomaly_detection = b_xent(logits_v1, batch_labels) + b_xent(logits_v2, batch_labels)
 
-            loss = loss.detach().cpu().numpy()
-            loss_full_batch[idx] = loss_all[: cur_batch_size].detach()
+            cur_loss_matrix[indices] = torch.cat(
+                (loss_anomaly_detection[:current_batch_size], loss_anomaly_detection[current_batch_size:]), dim=1)
+            feature_diff[indices] = ((h_v1 - g_v1) + (h_v2 - g_v2)) / 2  # Unused but kept for structure
 
-            if not is_final_batch:
-                total_loss += loss
+            total_batch_loss = torch.mean(loss_anomaly_detection) + loss_cl_terms * args.alpha
 
-        mean_loss = (total_loss * batch_size + loss * cur_batch_size) / nb_nodes
-      
-        loss_matrix_list.append(loss_matrix)
-        w = 5 
-        if len(loss_matrix_list) >= w:
-            s_matrix = torch.cat(loss_matrix_list[-w:], dim=1)
-    
-            mean_p, var_p = torch.mean(s_matrix[:, 0::2], dim=1), torch.var(s_matrix[:, 0::2], dim=1)
-            mean_n, var_n = torch.mean(s_matrix[:, 1::2], dim=1), torch.var(s_matrix[:, 1::2], dim=1)
-            
-            s_matrix = torch.cat([s_matrix, mean_p.unsqueeze(1), var_p.unsqueeze(1), mean_n.unsqueeze(1), var_n.unsqueeze(1)], dim=1)
+            total_batch_loss.backward()
+            optimizer.step()
 
-            ano_sim = torch.sigmoid(torch.mm(s_matrix, s_matrix.t()) * 0.07)
+            batch_loss_val = total_batch_loss.detach().cpu().numpy()
+            full_batch_loss[indices] = loss_anomaly_detection[: current_batch_size].detach()
 
-            loss_matrix_list = loss_matrix_list[-w:]
+            if not is_last_batch:
+                total_epoch_loss += batch_loss_val
 
-        if mean_loss < best:
-            best = mean_loss
-            best_t = epoch
-            cnt_wait = 0
-            torch.save(model.state_dict(), './SAAGCL/results/best_model_{}.pkl'.format(args.dataset))
+        mean_epoch_loss = (total_epoch_loss * batch_size + batch_loss_val * current_batch_size) / num_nodes
+
+        loss_hist_list.append(cur_loss_matrix)
+        window_size = 5
+        if len(loss_hist_list) >= window_size:
+            sim_calc_matrix = torch.cat(loss_hist_list[-window_size:], dim=1)
+
+            mean_pos, var_pos = torch.mean(sim_calc_matrix[:, 0::2], dim=1), torch.var(sim_calc_matrix[:, 0::2], dim=1)
+            mean_neg, var_neg = torch.mean(sim_calc_matrix[:, 1::2], dim=1), torch.var(sim_calc_matrix[:, 1::2], dim=1)
+
+            sim_calc_matrix = torch.cat(
+                [sim_calc_matrix, mean_pos.unsqueeze(1), var_pos.unsqueeze(1), mean_neg.unsqueeze(1),
+                 var_neg.unsqueeze(1)], dim=1)
+
+            ano_sim_matrix = torch.sigmoid(torch.mm(sim_calc_matrix, sim_calc_matrix.t()) * 0.07)
+
+            loss_hist_list = loss_hist_list[-window_size:]
+
+        if mean_epoch_loss < best_loss:
+            best_loss = mean_epoch_loss
+            best_ep = epoch_num
+            wait_count = 0
+            torch.save(gcl_model.state_dict(), './SAAGCL/results/best_model_{}.pkl'.format(args.dataset))
         else:
-            cnt_wait += 1
-        
+            wait_count += 1
 
-        pbar.set_postfix(loss=mean_loss)
-        pbar.update(1)
-
+        prog_bar.set_postfix(loss=mean_epoch_loss)
+        prog_bar.update(1)
 
 # Test model
-print('Loading {}th epoch'.format(best_t))
-model.load_state_dict(torch.load('./SAAGCL/results/best_model_{}.pkl'.format(args.dataset)))
+print('Loading {}th epoch'.format(best_ep))
+gcl_model.load_state_dict(torch.load('./SAAGCL/results/best_model_{}.pkl'.format(args.dataset)))
 
-multi_round_ano_score = np.zeros((args.test_rounds, nb_nodes))
-multi_round_ano_score_p = np.zeros((args.test_rounds, nb_nodes))
-multi_round_ano_score_n = np.zeros((args.test_rounds, nb_nodes))
+multi_round_scores = np.zeros((args.test_rounds, num_nodes))
 
-with tqdm(total=args.test_rounds) as pbar_test:
-    pbar_test.set_description('Testing')
-    for round in range(args.test_rounds):
+with tqdm(total=args.test_rounds) as prog_bar_test:
+    prog_bar_test.set_description('Testing')
+    for round_idx in range(args.test_rounds):
 
-        all_idx = list(range(nb_nodes))
-        random.shuffle(all_idx)
+        all_indices = list(range(num_nodes))
+        random.shuffle(all_indices)
 
-        subgraphs = generate_rwr_subgraph(dgl_graph, subgraph_size)
+        subg_set = generate_rwr_subgraph(dgl_g, subgraph_size)
 
-        for batch_idx in range(batch_num):
+        for batch_num_idx in range(num_batches):
 
-            optimiser.zero_grad()
+            optimizer.zero_grad()
 
-            is_final_batch = (batch_idx == (batch_num - 1))
+            is_last_batch = (batch_num_idx == (num_batches - 1))
 
-            if not is_final_batch:
-                idx = all_idx[batch_idx * batch_size: (batch_idx + 1) * batch_size]
+            if not is_last_batch:
+                indices = all_indices[batch_num_idx * batch_size: (batch_num_idx + 1) * batch_size]
             else:
-                idx = all_idx[batch_idx * batch_size:]
+                indices = all_indices[batch_num_idx * batch_size:]
 
-            cur_batch_size = len(idx)
+            current_batch_size = len(indices)
 
-            ba = []
-            bf = []
-            added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size)).to(device)
-            added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1)).to(device)
-            added_adj_zero_col[:, -1, :] = 1.
-            added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size)).to(device)
+            batch_adj_list = []
+            batch_feat_list = []
+            pad_adj_row_b = torch.zeros((current_batch_size, 1, subgraph_size)).to(dev_id)
+            pad_adj_col_b = torch.zeros((current_batch_size, subgraph_size + 1, 1)).to(dev_id)
+            pad_adj_col_b[:, -1, :] = 1.
+            pad_feat_row_b = torch.zeros((current_batch_size, 1, feature_size)).to(dev_id)
 
-            for i in idx:
-                cur_adj = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
-                cur_feat = features[:, subgraphs[i], :]
-                ba.append(cur_adj)
-                bf.append(cur_feat)
+            for i in indices:
+                current_adj = adj_matrix[:, subg_set[i], :][:, :, subg_set[i]]
+                current_feat = feat_data[:, subg_set[i], :]
+                batch_adj_list.append(current_adj)
+                batch_feat_list.append(current_feat)
 
-            ba = torch.cat(ba).to(device)
-            ba = torch.cat((ba, added_adj_zero_row), dim=1)
-            ba = torch.cat((ba, added_adj_zero_col), dim=2)
-            bf = torch.cat(bf).to(device)
-            bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]), dim=1)
+            b_adj = torch.cat(batch_adj_list).to(dev_id)
+            b_adj = torch.cat((b_adj, pad_adj_row_b), dim=1)
+            b_adj = torch.cat((b_adj, pad_adj_col_b), dim=2)
+            b_feat = torch.cat(batch_feat_list).to(dev_id)
+            b_feat = torch.cat((b_feat[:, :-1, :], pad_feat_row_b, b_feat[:, -1:, :]), dim=1)
 
             with torch.no_grad():
-                logits, h_mv, _ = model(bf, ba)
-                logits = torch.squeeze(logits)
-                logits = torch.sigmoid(logits)
+                logits_out, h_mv_out, _ = gcl_model(b_feat, b_adj)
+                logits_out = torch.squeeze(logits_out)
+                logits_out = torch.sigmoid(logits_out)
 
-            ano_score = - (logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
-            multi_round_ano_score[round, idx] = ano_score
+            # Anomaly score calculation
+            score_batch = - (logits_out[:current_batch_size] - logits_out[current_batch_size:]).cpu().numpy()
+            multi_round_scores[round_idx, indices] = score_batch
 
-        pbar_test.update(1)
+        prog_bar_test.update(1)
 
-ano_score_final = np.mean(multi_round_ano_score, axis=0)
-auc = roc_auc_score(ano_label, ano_score_final)
+final_anomaly_scores = np.mean(multi_round_scores, axis=0)
+auc_result = roc_auc_score(anomaly_labels, final_anomaly_scores)
 
-print('AUC:{:.4f}'.format(auc))
+print('AUC:{:.4f}'.format(auc_result))

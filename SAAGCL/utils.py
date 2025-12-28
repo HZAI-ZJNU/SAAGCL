@@ -6,104 +6,110 @@ import scipy.io as sio
 import dgl
 
 
-def sparse_to_tuple(sparse_mx, insert_batch=False):
-    """Convert sparse matrix to tuple representation."""
-    """Set insert_batch=True if you want to insert a batch dimension."""
-    def to_tuple(mx):
+def sparse_to_tuple_rep(sparse_matrix, add_batch_dim=False):
+    """Convert sparse matrix to tuple representation (coords, values, shape)."""
+    """Set add_batch_dim=True if you want to insert a batch dimension."""
+
+    def matrix_to_tuple(mx):
         if not sp.isspmatrix_coo(mx):
             mx = mx.tocoo()
-        if insert_batch:
-            coords = np.vstack((np.zeros(mx.row.shape[0]), mx.row, mx.col)).transpose()
-            values = mx.data
-            shape = (1,) + mx.shape
+        if add_batch_dim:
+            coordinates = np.vstack((np.zeros(mx.row.shape[0]), mx.row, mx.col)).transpose()
+            values_data = mx.data
+            matrix_shape = (1,) + mx.shape
         else:
-            coords = np.vstack((mx.row, mx.col)).transpose()
-            values = mx.data
-            shape = mx.shape
-        return coords, values, shape
+            coordinates = np.vstack((mx.row, mx.col)).transpose()
+            values_data = mx.data
+            matrix_shape = mx.shape
+        return coordinates, values_data, matrix_shape
 
-    if isinstance(sparse_mx, list):
-        for i in range(len(sparse_mx)):
-            sparse_mx[i] = to_tuple(sparse_mx[i])
+    if isinstance(sparse_matrix, list):
+        for i in range(len(sparse_matrix)):
+            sparse_matrix[i] = matrix_to_tuple(sparse_matrix[i])
     else:
-        sparse_mx = to_tuple(sparse_mx)
+        sparse_matrix = matrix_to_tuple(sparse_matrix)
 
-    return sparse_mx
+    return sparse_matrix
 
 
-def preprocess_features(features):
+def preprocess_features(input_features):
     """Row-normalize feature matrix and convert to tuple representation"""
-    rowsum = np.array(features.sum(1))
-    r_inv = np.power(rowsum, -1).flatten()
+    row_sum = np.array(input_features.sum(1))
+    r_inv = np.power(row_sum, -1).flatten()
     r_inv[np.isinf(r_inv)] = 0.
     r_mat_inv = sp.diags(r_inv)
-    features = r_mat_inv.dot(features)
-    return features.todense(), sparse_to_tuple(features)
+    norm_features = r_mat_inv.dot(input_features)
+    return norm_features.todense(), sparse_to_tuple_rep(norm_features)
 
 
-def normalize_adj(adj):
+def normalize_adj(adj_matrix):
     """Symmetrically normalize adjacency matrix."""
-    adj = sp.coo_matrix(adj)
-    rowsum = np.array(adj.sum(1))
-    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+    adj_matrix = sp.coo_matrix(adj_matrix)
+    row_sum = np.array(adj_matrix.sum(1))
+    d_inv_sqrt = np.power(row_sum, -0.5).flatten()
     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-    return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
+    return adj_matrix.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
 
 
-def dense_to_one_hot(labels_dense, num_classes):
+def dense_to_one_hot(label_vector, num_classes):
     """Convert class labels from scalars to one-hot vectors."""
-    num_labels = labels_dense.shape[0]
+    num_labels = label_vector.shape[0]
     index_offset = np.arange(num_labels) * num_classes
     labels_one_hot = np.zeros((num_labels, num_classes))
-    labels_one_hot.flat[index_offset+labels_dense.ravel()] = 1
+    labels_one_hot.flat[index_offset + label_vector.ravel()] = 1
     return labels_one_hot
 
 
-def load_mat(dataset, train_rate=0.3, val_rate=0.1):
+def load_mat(dataset_name, train_rate=0.3, val_rate=0.1):
     """Load .mat dataset."""
-    data = sio.loadmat("./Data/{}.mat".format(dataset))
-    label = data['Label'] if ('Label' in data) else data['gnd']
-    attr = data['Attributes'] if ('Attributes' in data) else data['X']
-    network = data['Network'] if ('Network' in data) else data['A']
-    
-    adj = sp.csr_matrix(network)
-    feat = sp.lil_matrix(attr)
+    data_dict = sio.loadmat("./Data/{}.mat".format(dataset_name))
+    class_labels = data_dict['Label'] if ('Label' in data_dict) else data_dict['gnd']
+    features_attr = data_dict['Attributes'] if ('Attributes' in data_dict) else data_dict['X']
+    network_data = data_dict['Network'] if ('Network' in data_dict) else data_dict['A']
 
-    ano_labels = np.squeeze(np.array(label))
+    adj_mat = sp.csr_matrix(network_data)
+    feat_mat = sp.lil_matrix(features_attr)
 
-    return adj, feat, ano_labels
+    anomaly_status = np.squeeze(np.array(class_labels))
+
+    return adj_mat, feat_mat, anomaly_status
 
 
-def adj_to_dgl_graph(adj):
+def adj_to_dgl_graph(adj_matrix):
     """Convert adjacency matrix to dgl format."""
     if hasattr(nx, 'from_scipy_sparse_array'):
-        nx_graph = nx.from_scipy_sparse_array(adj)
+        nx_graph = nx.from_scipy_sparse_array(adj_matrix)
     else:
-        nx_graph = nx.from_scipy_sparse_matrix(adj)
-    dgl_graph = dgl.DGLGraph(nx_graph)
-    return dgl_graph
+        nx_graph = nx.from_scipy_sparse_matrix(adj_matrix)
+    dgl_g = dgl.DGLGraph(nx_graph)
+    return dgl_g
 
 
-def generate_rwr_subgraph(dgl_graph, subgraph_size):
+def generate_rwr_subgraph(dgl_graph, required_size):
     """Generate subgraph with RWR algorithm."""
-    all_idx = list(range(dgl_graph.number_of_nodes()))
-    reduced_size = subgraph_size - 1
-    traces = dgl.contrib.sampling.random_walk_with_restart(dgl_graph, all_idx, restart_prob=1, max_nodes_per_seed=subgraph_size*3)
+    all_indices = list(range(dgl_graph.number_of_nodes()))
+    reduced_size = required_size - 1
+    traces = dgl.contrib.sampling.random_walk_with_restart(dgl_graph, all_indices, restart_prob=1,
+                                                           max_nodes_per_seed=required_size * 3)
 
-    subv = []
+    subgraph_nodes_list = []
 
-    for i,trace in enumerate(traces):
-        subv.append(torch.unique(torch.cat(trace),sorted=False).tolist())
-        retry_time = 0
-        while len(subv[i]) < reduced_size:
-            cur_trace = dgl.contrib.sampling.random_walk_with_restart(dgl_graph, [i], restart_prob=0.9, max_nodes_per_seed=subgraph_size*5)
+    for i, trace in enumerate(traces):
+        unique_nodes = torch.unique(torch.cat(trace), sorted=False).tolist()
+        subgraph_nodes_list.append(unique_nodes)
 
-            subv[i] = torch.unique(torch.cat(cur_trace[0]),sorted=False).tolist()
-            retry_time += 1
-            if (len(subv[i]) <= 2) and (retry_time >10):
-                subv[i] = (subv[i] * reduced_size)
-        subv[i] = subv[i][:reduced_size]
-        subv[i].append(i)
+        retry_counter = 0
+        while len(subgraph_nodes_list[i]) < reduced_size:
+            current_trace = dgl.contrib.sampling.random_walk_with_restart(dgl_graph, [i], restart_prob=0.9,
+                                                                          max_nodes_per_seed=required_size * 5)
 
-    return subv
+            subgraph_nodes_list[i] = torch.unique(torch.cat(current_trace[0]), sorted=False).tolist()
+            retry_counter += 1
+            if (len(subgraph_nodes_list[i]) <= 2) and (retry_counter > 10):
+                subgraph_nodes_list[i] = (subgraph_nodes_list[i] * reduced_size)
+
+        subgraph_nodes_list[i] = subgraph_nodes_list[i][:reduced_size]
+        subgraph_nodes_list[i].append(i)
+
+    return subgraph_nodes_list
