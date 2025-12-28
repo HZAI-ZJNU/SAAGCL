@@ -23,7 +23,7 @@ contrastive learning* (SAA-GCL). The datasets are included in the Data/ folder.
 
 ## Usage
 ```
-python ./SAAGCL/run.py --dataset 'reddit' --lr 4e-3 --num_epoch 100 --threshold 8 --alpha 0.2 --tau 0.2 --gpu_id 0
+python ./SAAGCL/run.py --dataset 'reddit' --lr 4e-3 --train_epoch 100 --threshold 8 --alpha 0.2 --tau 0.2 --gpu_id 0
 ```
 
 

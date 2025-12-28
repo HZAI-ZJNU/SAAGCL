@@ -21,8 +21,8 @@ parser.add_argument('--dataset', type=str, default='citeseer')
 parser.add_argument('--lr', type=float)
 parser.add_argument('--seed', type=int, default=1)
 parser.add_argument('--embedding_dim', type=int, default=64)
-parser.add_argument('--num_epoch', type=int)
-parser.add_argument('--auc_test_rounds', type=int, default=256)
+parser.add_argument('--train_epoch', type=int)
+parser.add_argument('--test_rounds', type=int, default=256)
 parser.add_argument('--threshold', type=int, default=8)
 parser.add_argument('--alpha', type=float, default=0.2)
 parser.add_argument('--tau', type=float, default=0.07)
@@ -30,7 +30,7 @@ parser.add_argument('--degree', type=int, default=6)
 parser.add_argument('--batch_size', type=int, default=300)
 parser.add_argument('--subgraph_size', type=int, default=4)
 parser.add_argument('--readout', type=str, default='avg')  #max min avg weighted_sum
-parser.add_argument('--negsamp_ratio', type=int, default=1)
+parser.add_argument('--neg_sam_rat', type=int, default=1)
 parser.add_argument('--drop_prob', type=float, default=0.0)
 parser.add_argument('--weight_decay', type=float, default=0.0)
 parser.add_argument('--gpu_id', type=int, default=0)
@@ -80,7 +80,7 @@ features = torch.FloatTensor(features[np.newaxis]).to(device)
 adj = torch.FloatTensor(adj[np.newaxis]).to(device)
 
 # Initialize model and optimiser
-model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout).to(device)
+model = Model(ft_size, args.embedding_dim, 'prelu', args.neg_sam_rat, args.readout).to(device)
 optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
 gene = Gene(nb_nodes, ft_size, 128)
@@ -90,7 +90,7 @@ bce_loss = nn.BCELoss().to(device)
 
 best_gene = copy.deepcopy(gene)
 
-b_xent = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor([args.negsamp_ratio]).to(device))
+b_xent = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor([args.neg_sam_rat]).to(device))
 
 xent = nn.CrossEntropyLoss().to(device)
 alter = 0
@@ -106,11 +106,11 @@ added_adj_zero_col[:,-1,:] = 1.
 added_feat_zero_row = torch.zeros((nb_nodes, 1, ft_size)).to(device)
 
 # Train model
-with tqdm(total=args.num_epoch) as pbar:
+with tqdm(total=args.train_epoch) as pbar:
     pbar.set_description('Training')
     loss_matrix_list = []
 
-    for epoch in range(args.num_epoch):
+    for epoch in range(args.train_epoch):
 
         loss_full_batch = torch.zeros((nb_nodes,1)).to(device)
 
@@ -125,7 +125,7 @@ with tqdm(total=args.num_epoch) as pbar:
         diff_feat = torch.zeros((nb_nodes,args.embedding_dim)).to(device)
       
 
-        if epoch < args.num_epoch // 2:
+        if epoch < args.train_epoch // 2:
             graph1, adj1 = dgl_graph, adj
             graph2, feat1, feat2, adj2 = redundancy_pruning(dgl_graph, adj_tensor, sim, features.squeeze(), degree, 0.2, 0.2, args.threshold)
         else:
@@ -149,7 +149,7 @@ with tqdm(total=args.num_epoch) as pbar:
 
             cur_batch_size = len(idx)
 
-            lbl = torch.unsqueeze(torch.cat((torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio))), 1).to(device)
+            lbl = torch.unsqueeze(torch.cat((torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.neg_sam_rat))), 1).to(device)
 
             ba = []
             bf = []
@@ -251,13 +251,13 @@ with tqdm(total=args.num_epoch) as pbar:
 print('Loading {}th epoch'.format(best_t))
 model.load_state_dict(torch.load('./SAAGCL/results/best_model_{}.pkl'.format(args.dataset)))
 
-multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes))
-multi_round_ano_score_p = np.zeros((args.auc_test_rounds, nb_nodes))
-multi_round_ano_score_n = np.zeros((args.auc_test_rounds, nb_nodes))
+multi_round_ano_score = np.zeros((args.test_rounds, nb_nodes))
+multi_round_ano_score_p = np.zeros((args.test_rounds, nb_nodes))
+multi_round_ano_score_n = np.zeros((args.test_rounds, nb_nodes))
 
-with tqdm(total=args.auc_test_rounds) as pbar_test:
+with tqdm(total=args.test_rounds) as pbar_test:
     pbar_test.set_description('Testing')
-    for round in range(args.auc_test_rounds):
+    for round in range(args.test_rounds):
 
         all_idx = list(range(nb_nodes))
         random.shuffle(all_idx)
