@@ -36,6 +36,16 @@ This code requires the following:
 - tqdm>=4.67.1
 - numpy>=1.24.3
 - networkx>=2.7
-- dgl<=0.4.3.post1
+- dgl<=0.4.3
 
 ## Cite
+```
+@article{CHEN2026115455,
+title = {Structure adversarial augmented graph anomaly detection via multi-view contrastive learning},
+author = {Qian Chen and Huiying Xu and Ruidong Wang and Yue Liu and Xinzhong Zhu},
+journal = {Knowledge-Based Systems},
+pages = {115455},
+year = {2026},
+doi = {https://doi.org/10.1016/j.knosys.2026.115455}
+}
+```
