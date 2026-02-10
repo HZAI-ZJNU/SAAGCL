@@ -40,7 +40,7 @@ This code requires the following:
 
 ## Cite
 ```
-@article{CHEN2026115455,
+@article{chen2026saagcl,
 title = {Structure adversarial augmented graph anomaly detection via multi-view contrastive learning},
 author = {Qian Chen and Huiying Xu and Ruidong Wang and Yue Liu and Xinzhong Zhu},
 journal = {Knowledge-Based Systems},
